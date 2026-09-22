@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import lancedb
+from lancedb.index import FTS
 import pyarrow as pa
 
 from palace.config import Settings, get_settings
@@ -48,7 +49,7 @@ class LanceFileStore:
         location = Path(lance_dir or self.settings.paths.lance_dir)
         location.mkdir(parents=True, exist_ok=True)
         self.db = lancedb.connect(str(location))
-        table_names = self.db.table_names()
+        table_names = self.db.list_tables()
         if CHUNK_TABLE_NAME in table_names:
             self.table = self.db.open_table(CHUNK_TABLE_NAME)
         else:
@@ -63,7 +64,7 @@ class LanceFileStore:
         names = {getattr(index, "name", "") for index in self.table.list_indices()}
         if not any(FTS_COLUMN in name for name in names):
             # Deliberately use Lance native FTS; no deprecated Tantivy flags.
-            self.table.create_fts_index(FTS_COLUMN)
+            self.table.create_index(FTS_COLUMN, config=FTS(), replace=True)
 
     def upsert_chunks(self, chunks: list[DocumentChunk]) -> None:
         if not chunks:
