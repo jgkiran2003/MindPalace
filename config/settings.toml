@@ -1,0 +1,40 @@
+[paths]
+vault_dir        = "data/vault"                      # markdown source files — immutable store's source of truth
+lance_dir        = "data/lance"                       # LanceDB table files
+claims_db_path   = "data/claims.db"                   # SQLite claims store
+schema_sql_path  = "src/palace/stores/schema.sql"      # DDL applied on first claims_db connection
+temp_audio_dir   = "data/tmp_audio"                    # raw voice captures, retained until compiled note confirmed
+
+[embedding]
+model       = "nomic-embed-text"       # served via Ollama
+dimension   = 768                       # must match `vector` field width in lance_schema.py and vec_claims in schema.sql
+ollama_host = "http://localhost:11434"
+batch_size  = 16                        # chunks embedded per Ollama request during indexing
+
+[reranker]
+model      = "ms-marco-TinyBERT-L-2-v2"   # ONNX, loaded via the `rerankers` library (FlashRank backend)
+max_length = 512                          # token truncation length per (query, candidate) pair
+device     = "cpu"
+
+[retrieval]
+top_k              = 40      # RRF candidate pool depth, before reranking
+retrieval_top_k    = 8       # final candidate count returned to the generation layer
+claims_search_k    = 20      # k passed into ClaimsStoreAdapter.search_claims()
+rrf_k              = 60      # RRF damping constant (Cormack et al. default)
+raw_status_penalty = 0.4     # post-FlashRank multiplier applied to chunks with status == "raw"
+
+[llm]
+ollama_host              = "http://localhost:11434"
+fast_tier_model          = "qwen3:4b"     # claim extraction, raw/compiled classification, intent routing
+reasoning_tier_model     = "qwen3:14b"    # Jarvis conversation, grounded generation
+fast_tier_temperature    = 0.1
+reasoning_tier_temperature = 0.4
+request_timeout_seconds  = 60
+
+[claims]
+high_severity_blocks_auto_resolve = true   # Severity.HIGH claims always route to needs_review, regardless of is_explicit
+compaction_age_days               = 180    # superseded claims older than this are eligible for compaction
+compaction_min_count               = 5     # minimum superseded claims per claim_key before a compaction pass runs
+
+[indexing]
+optimize_after_writes = 25   # call table.optimize() after this many chunk upserts, folding new rows into FTS/vector indexes
