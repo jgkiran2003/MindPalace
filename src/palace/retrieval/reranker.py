@@ -16,6 +16,7 @@ class FlashRankReranker:
             ranker = Reranker(
                 model_name=self.settings.reranker.model,
                 model_type="flashrank",
+                verbose=0,
             )
         self.ranker = ranker
 
