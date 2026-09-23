@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 import pytest
 
-from palace.cli import rerank_and_penalize
+from palace.retrieval.hybrid_searcher import rerank_and_penalize
 from palace.domain.models import ChunkStatus, DocumentChunk, Severity, SourceType
 from palace.ingestion.chunker import chunk_markdown
 from palace.retrieval.retrieval_types import Candidate
@@ -86,6 +86,10 @@ def test_lancedb_vector_and_native_fts_retrieval(tmp_path: Path) -> None:
     assert vector_results[0].chunk_id == "vector-match"
     assert [chunk.chunk_id for chunk in fts_results] == ["text-match"]
     assert any(index.index_type == "FTS" for index in store.table.list_indices())
+
+    reopened = LanceFileStore(tmp_path / "lance")
+    reopened_results = reopened.vector_search(_vector(0), limit=2)
+    assert reopened_results[0].chunk_id == "vector-match"
 
 
 class _FixedReranker:

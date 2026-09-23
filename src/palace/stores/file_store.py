@@ -49,7 +49,7 @@ class LanceFileStore:
         location = Path(lance_dir or self.settings.paths.lance_dir)
         location.mkdir(parents=True, exist_ok=True)
         self.db = lancedb.connect(str(location))
-        table_names = self.db.list_tables()
+        table_names = self.db.list_tables().tables
         if CHUNK_TABLE_NAME in table_names:
             self.table = self.db.open_table(CHUNK_TABLE_NAME)
         else:
