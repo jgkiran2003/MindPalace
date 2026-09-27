@@ -1,0 +1,1 @@
+"""Raw-note compilation lifecycle."""

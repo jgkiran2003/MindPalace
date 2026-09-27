@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import click
 
+from palace.claims.extractor import extract_claim_proposals
+from palace.claims.resolver import resolve_and_store_proposals
+from palace.compilation.compiler import compile_raw_notes
 from palace.config import Settings, get_settings
 from palace.domain.models import (
     Claim,
@@ -16,9 +20,11 @@ from palace.domain.models import (
     SourceType,
 )
 from palace.ingestion.indexer import index_vault
+from palace.llm.client import OllamaClient
 from palace.llm.embedder import OllamaEmbedder
 from palace.retrieval.hybrid_searcher import HybridSearcher
 from palace.retrieval.reranker import FlashRankReranker
+from palace.retrieval.retrieval_types import Candidate
 from palace.stores.claims_store import SQLiteClaimsStore
 from palace.stores.file_store import LanceFileStore
 
@@ -61,6 +67,16 @@ class _ReopeningClaimsStoreAdapter:
             return store.get_conflict_group(claim_key)
 
 
+def _build_searcher(settings: Settings) -> HybridSearcher:
+    return HybridSearcher(
+        file_store=LanceFileStore(settings=settings),
+        claims_store=_ReopeningClaimsStoreAdapter(settings),
+        embedder=OllamaEmbedder(settings=settings),
+        reranker=FlashRankReranker(settings=settings),
+        settings=settings,
+    )
+
+
 @click.group()
 def app() -> None:
     """MindPalace CLI."""
@@ -75,16 +91,14 @@ def index_command() -> None:
 @app.command("search")
 @click.argument("query")
 def search_command(query: str) -> None:
-    settings = get_settings()
-    searcher = HybridSearcher(
-        file_store=LanceFileStore(settings=settings),
-        claims_store=_ReopeningClaimsStoreAdapter(settings),
-        embedder=OllamaEmbedder(settings=settings),
-        reranker=FlashRankReranker(settings=settings),
-        settings=settings,
-    )
-    results = asyncio.run(searcher.retrieve(query))
+    results = asyncio.run(_build_searcher(get_settings()).retrieve(query))
+    _print_candidates(results)
 
+
+def _print_candidates(results: list[Candidate]) -> None:
+    if not results:
+        click.echo("No results found.")
+        return
     for position, candidate in enumerate(results, start=1):
         if candidate.kind == "chunk":
             chunk = candidate.payload
@@ -107,6 +121,197 @@ def search_command(query: str) -> None:
             for sibling in candidate.conflict_group.claims:
                 click.echo(f"      - {sibling.value}")
         click.echo()
+
+
+def _context_for_prompt(candidates: list[Candidate]) -> str:
+    if not candidates:
+        return "No relevant stored context was found."
+    sections: list[str] = []
+    for candidate in candidates:
+        if candidate.kind == "chunk":
+            chunk = candidate.payload
+            label = f"document {chunk.doc_path} chunk {chunk.chunk_index}"
+        else:
+            claim = candidate.payload
+            label = f"claim {claim.claim_key} ({claim.status.value})"
+        sections.append(f"[{label}]\n{candidate.text}")
+    return "\n\n".join(sections)
+
+
+def _print_proposal_table(proposals: list[ClaimProposal]) -> None:
+    if not proposals:
+        click.echo("No claims proposed.")
+        return
+    headers = ("Entity", "Attribute", "Value", "Is Explicit", "Severity")
+    rows = [
+        (
+            proposal.entity,
+            proposal.attribute,
+            proposal.value,
+            "yes" if proposal.is_explicit else "no",
+            proposal.severity.value,
+        )
+        for proposal in proposals
+    ]
+    widths = [
+        max(len(header), *(len(row[index]) for row in rows))
+        for index, header in enumerate(headers)
+    ]
+    template = "  ".join(f"{{:{width}}}" for width in widths)
+    click.echo(template.format(*headers))
+    click.echo(template.format(*("-" * width for width in widths)))
+    for row in rows:
+        click.echo(template.format(*row))
+
+
+TRIVIAL_CHAT = {"hi", "hello", "hey", "thanks", "ok", "okay"}
+
+
+async def _process_claim_exchange(
+    dialogue: list[dict[str, str]],
+    *,
+    dry_run: bool,
+    llm: OllamaClient,
+    embedder: OllamaEmbedder,
+    claims_store: _ReopeningClaimsStoreAdapter,
+    lock: asyncio.Lock,
+) -> list[ClaimProposal]:
+    """Extract and resolve user claims without retrieval or response context."""
+    exchange_text = "\n".join(
+        f"{message['role'].capitalize()}: {message['content']}"
+        for message in dialogue
+    )
+    try:
+        async with lock:
+            proposals = await asyncio.to_thread(
+                extract_claim_proposals,
+                exchange_text,
+                client=llm,
+            )
+            await asyncio.to_thread(
+                resolve_and_store_proposals,
+                proposals,
+                embedder,
+                claims_store,
+                dry_run=dry_run,
+            )
+            return proposals
+    except Exception:
+        return []
+
+
+@app.command("chat")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Preview extracted claims without saving them.",
+)
+def chat_command(dry_run: bool) -> None:
+    """Start an interactive, retrieval-grounded conversation."""
+    asyncio.run(_chat_runner(dry_run))
+
+
+async def _chat_runner(dry_run: bool) -> None:
+    settings = get_settings()
+    llm = OllamaClient(settings=settings)
+    embedder = OllamaEmbedder(settings=settings)
+    claims_store = _ReopeningClaimsStoreAdapter(settings)
+    history: list[dict[str, str]] = []
+    searcher: HybridSearcher | None = None
+    claim_lock = asyncio.Lock()
+    claim_tasks: set[asyncio.Task[list[ClaimProposal]]] = set()
+
+    click.echo("MindPalace chat. Type 'quit' or 'exit' to leave.")
+    try:
+        while True:
+            try:
+                user_input = (
+                    await asyncio.to_thread(click.prompt, "You", prompt_suffix="> ")
+                ).strip()
+            except (click.Abort, EOFError, KeyboardInterrupt):
+                click.echo("\nGoodbye.")
+                break
+            if not user_input:
+                continue
+            if user_input.casefold() in {"quit", "exit"}:
+                click.echo("Goodbye.")
+                break
+
+            cleaned = user_input.casefold().strip(" \t\r\n.!?,")
+            claim_task: asyncio.Task[list[ClaimProposal]] | None = None
+            if cleaned not in TRIVIAL_CHAT:
+                dialogue = [
+                    dict(message)
+                    for message in history[-2:]
+                ]
+                dialogue.append({"role": "user", "content": user_input})
+                claim_task = asyncio.create_task(
+                    _process_claim_exchange(
+                        dialogue,
+                        dry_run=dry_run,
+                        llm=llm,
+                        embedder=embedder,
+                        claims_store=claims_store,
+                        lock=claim_lock,
+                    )
+                )
+                claim_tasks.add(claim_task)
+                claim_task.add_done_callback(claim_tasks.discard)
+
+            if searcher is None:
+                searcher = await asyncio.to_thread(_build_searcher, settings)
+            candidates = await searcher.retrieve(user_input)
+            context = _context_for_prompt(candidates)
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Use the supplied context when relevant, distinguish stored "
+                        "facts from inference, and do not invent personal details.\n\n"
+                        f"Retrieved context:\n{context}"
+                    ),
+                },
+                *history,
+                {"role": "user", "content": user_input},
+            ]
+            print("Palace> ", end="", flush=True)
+            reply_parts: list[str] = []
+            async for token in llm.astream_messages(messages, tier="reasoning"):
+                reply_parts.append(token)
+                print(token, end="", flush=True)
+            print()
+            reply = "".join(reply_parts)
+            history.extend(
+                [
+                    {"role": "user", "content": user_input},
+                    {"role": "assistant", "content": reply},
+                ]
+            )
+
+            if dry_run and claim_task is not None:
+                proposals = await claim_task
+                click.echo("─" * 72)
+                click.echo("Proposed claims (dry run)")
+                _print_proposal_table(proposals)
+                click.echo("─" * 72)
+    finally:
+        if claim_tasks:
+            await asyncio.gather(*claim_tasks)
+        await llm.aclose()
+
+
+@app.command("compile")
+def compile_command() -> None:
+    """Compile a batch of unprocessed raw notes into structured Markdown."""
+    settings = get_settings()
+    output = compile_raw_notes(
+        Path(settings.paths.vault_dir),
+        client=OllamaClient(settings=settings),
+    )
+    if output is None:
+        click.echo("Not enough unprocessed raw notes to compile.")
+    else:
+        click.echo(f"Created compiled note: {output}")
 
 
 @app.group("claim")
