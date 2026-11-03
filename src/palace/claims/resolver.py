@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from palace.claims.outcomes import ClaimEmbeddingError, ClaimStorageError
 from palace.domain.models import Claim, ClaimProposal, ClaimStatus
 from palace.interfaces import ClaimsStoreAdapter
 
@@ -39,11 +40,22 @@ def resolve_and_store_proposals(
     if not proposals:
         return []
 
-    embeddings = embedder.embed_batch([proposal.value for proposal in proposals])
-    if len(embeddings) != len(proposals):
-        raise ValueError("embedder returned a different number of vectors than proposals")
+    # Embed everything first: an embedding failure must leave the store untouched.
+    try:
+        embeddings = embedder.embed_batch([proposal.value for proposal in proposals])
+        if len(embeddings) != len(proposals):
+            raise ValueError("embedder returned a different number of vectors than proposals")
+    except Exception as exc:
+        raise ClaimEmbeddingError(f"{type(exc).__name__}: {exc}") from exc
 
-    return [
-        claims_store.propose_claim(proposal, embedding)
-        for proposal, embedding in zip(proposals, embeddings, strict=True)
-    ]
+    # Each propose_claim is its own transaction, so a mid-batch failure keeps the
+    # earlier claims; report them instead of pretending nothing was written.
+    persisted: list[Claim] = []
+    for proposal, embedding in zip(proposals, embeddings, strict=True):
+        try:
+            persisted.append(claims_store.propose_claim(proposal, embedding))
+        except Exception as exc:
+            raise ClaimStorageError(
+                f"{type(exc).__name__}: {exc}", persisted
+            ) from exc
+    return persisted

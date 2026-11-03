@@ -8,6 +8,14 @@ from pathlib import Path
 import click
 
 from palace.claims.extractor import extract_claim_proposals
+from palace.claims.outcomes import (
+    ClaimEmbeddingError,
+    ClaimExchangeResult,
+    ClaimExtractionLLMError,
+    ClaimOutcome,
+    ClaimStorageError,
+    MalformedExtractionError,
+)
 from palace.claims.resolver import resolve_and_store_proposals
 from palace.compilation.compiler import CompilationError, compile_raw_notes
 from palace.config import Settings, get_settings
@@ -178,29 +186,124 @@ async def _process_claim_exchange(
     embedder: OllamaEmbedder,
     claims_store: _ReopeningClaimsStoreAdapter,
     lock: asyncio.Lock,
-) -> list[ClaimProposal]:
-    """Extract and resolve user claims without retrieval or response context."""
+) -> ClaimExchangeResult:
+    """Extract and resolve user claims, reporting exactly what happened.
+
+    Nothing is written unless extraction produced valid proposals; every
+    failure is returned as a distinct outcome rather than an empty list.
+    """
     exchange_text = "\n".join(
         f"{message['role'].capitalize()}: {message['content']}"
         for message in dialogue
     )
-    try:
-        async with lock:
+    async with lock:
+        try:
             proposals = await asyncio.to_thread(
                 extract_claim_proposals,
                 exchange_text,
                 client=llm,
             )
-            await asyncio.to_thread(
+        except MalformedExtractionError as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.MALFORMED_OUTPUT, dry_run=dry_run, error=str(exc)
+            )
+        except ClaimExtractionLLMError as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.LLM_FAILURE, dry_run=dry_run, error=str(exc)
+            )
+        except Exception as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.UNEXPECTED_ERROR,
+                dry_run=dry_run,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if not proposals:
+            return ClaimExchangeResult(ClaimOutcome.NO_CLAIMS, dry_run=dry_run)
+
+        try:
+            claims = await asyncio.to_thread(
                 resolve_and_store_proposals,
                 proposals,
                 embedder,
                 claims_store,
                 dry_run=dry_run,
             )
-            return proposals
-    except Exception:
-        return []
+        except ClaimEmbeddingError as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.LLM_FAILURE,
+                dry_run=dry_run,
+                proposals=proposals,
+                error=str(exc),
+            )
+        except ClaimStorageError as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.STORAGE_FAILURE,
+                dry_run=dry_run,
+                proposals=proposals,
+                claims=exc.persisted,
+                error=str(exc),
+            )
+        except Exception as exc:
+            return ClaimExchangeResult(
+                ClaimOutcome.UNEXPECTED_ERROR,
+                dry_run=dry_run,
+                proposals=proposals,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return ClaimExchangeResult(
+            ClaimOutcome.SUCCESS, dry_run=dry_run, proposals=proposals, claims=claims
+        )
+
+
+def _report_claim_result(result: ClaimExchangeResult) -> None:
+    summary = result.describe()
+    if summary is not None:
+        click.echo(f"[claims] {summary}", err=not result.ok)
+
+
+def _report_finished_claim_tasks(
+    tasks: list[asyncio.Task[ClaimExchangeResult]],
+) -> None:
+    """Print (once) the outcome of background claim tasks that have finished."""
+    for task in list(tasks):
+        if not task.done():
+            continue
+        tasks.remove(task)
+        if task.cancelled():
+            click.echo("[claims] claim extraction was cancelled", err=True)
+        elif task.exception() is not None:
+            click.echo(f"[claims] unexpected error: {task.exception()}", err=True)
+        else:
+            _report_claim_result(task.result())
+
+
+async def _stream_reply(
+    searcher: HybridSearcher,
+    llm: OllamaClient,
+    history: list[dict[str, str]],
+    user_input: str,
+) -> str:
+    candidates = await searcher.retrieve(user_input)
+    context = _context_for_prompt(candidates)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Use the supplied context when relevant, distinguish stored "
+                "facts from inference, and do not invent personal details.\n\n"
+                f"Retrieved context:\n{context}"
+            ),
+        },
+        *history,
+        {"role": "user", "content": user_input},
+    ]
+    print("Palace> ", end="", flush=True)
+    reply_parts: list[str] = []
+    async for token in llm.astream_messages(messages, tier="reasoning"):
+        reply_parts.append(token)
+        print(token, end="", flush=True)
+    print()
+    return "".join(reply_parts)
 
 
 @app.command("chat")
@@ -215,6 +318,8 @@ def chat_command(dry_run: bool) -> None:
 
 
 async def _chat_runner(dry_run: bool) -> None:
+    # Conversation history lives in memory for this session only; Phase 4 has
+    # no persistent chat store (durable knowledge goes through claims).
     settings = get_settings()
     llm = OllamaClient(settings=settings)
     embedder = OllamaEmbedder(settings=settings)
@@ -222,11 +327,12 @@ async def _chat_runner(dry_run: bool) -> None:
     history: list[dict[str, str]] = []
     searcher: HybridSearcher | None = None
     claim_lock = asyncio.Lock()
-    claim_tasks: set[asyncio.Task[list[ClaimProposal]]] = set()
+    unreported: list[asyncio.Task[ClaimExchangeResult]] = []
 
     click.echo("MindPalace chat. Type 'quit' or 'exit' to leave.")
     try:
         while True:
+            _report_finished_claim_tasks(unreported)
             try:
                 user_input = (
                     await asyncio.to_thread(click.prompt, "You", prompt_suffix="> ")
@@ -241,7 +347,7 @@ async def _chat_runner(dry_run: bool) -> None:
                 break
 
             cleaned = user_input.casefold().strip(" \t\r\n.!?,")
-            claim_task: asyncio.Task[list[ClaimProposal]] | None = None
+            claim_task: asyncio.Task[ClaimExchangeResult] | None = None
             if cleaned not in TRIVIAL_CHAT:
                 dialogue = [
                     dict(message)
@@ -258,48 +364,36 @@ async def _chat_runner(dry_run: bool) -> None:
                         lock=claim_lock,
                     )
                 )
-                claim_tasks.add(claim_task)
-                claim_task.add_done_callback(claim_tasks.discard)
+                if not dry_run:
+                    unreported.append(claim_task)
 
-            if searcher is None:
-                searcher = await asyncio.to_thread(_build_searcher, settings)
-            candidates = await searcher.retrieve(user_input)
-            context = _context_for_prompt(candidates)
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "Use the supplied context when relevant, distinguish stored "
-                        "facts from inference, and do not invent personal details.\n\n"
-                        f"Retrieved context:\n{context}"
-                    ),
-                },
-                *history,
-                {"role": "user", "content": user_input},
-            ]
-            print("Palace> ", end="", flush=True)
-            reply_parts: list[str] = []
-            async for token in llm.astream_messages(messages, tier="reasoning"):
-                reply_parts.append(token)
-                print(token, end="", flush=True)
-            print()
-            reply = "".join(reply_parts)
-            history.extend(
-                [
-                    {"role": "user", "content": user_input},
-                    {"role": "assistant", "content": reply},
-                ]
-            )
+            try:
+                if searcher is None:
+                    searcher = await asyncio.to_thread(_build_searcher, settings)
+                reply = await _stream_reply(searcher, llm, history, user_input)
+            except Exception as exc:
+                click.echo(f"\n[error] could not answer: {type(exc).__name__}: {exc}", err=True)
+            else:
+                history.extend(
+                    [
+                        {"role": "user", "content": user_input},
+                        {"role": "assistant", "content": reply},
+                    ]
+                )
 
             if dry_run and claim_task is not None:
-                proposals = await claim_task
+                result = await claim_task
                 click.echo("─" * 72)
                 click.echo("Proposed claims (dry run)")
-                _print_proposal_table(proposals)
+                _print_proposal_table(result.proposals)
+                if not result.ok:
+                    _report_claim_result(result)
                 click.echo("─" * 72)
     finally:
-        if claim_tasks:
-            await asyncio.gather(*claim_tasks)
+        # Let in-flight extractions finish (and report) before closing.
+        if unreported:
+            await asyncio.gather(*unreported, return_exceptions=True)
+            _report_finished_claim_tasks(unreported)
         await llm.aclose()
 
 

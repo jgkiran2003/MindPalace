@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from palace.claims.outcomes import ClaimExtractionLLMError, MalformedExtractionError
 from palace.domain.models import ClaimProposal, Severity, SourceType
 from palace.llm.client import OllamaClient
 
@@ -91,14 +92,23 @@ def extract_claim_proposals(
         "list: [].\n\n"
         f"Dialogue:\n{text.strip()}"
     )
-    result = llm.structured(
-        prompt,
-        ExtractedClaims,
-        tier="fast",
-        system=(
-            "You are a precise structured fact extractor. Output only valid JSON "
-            "matching the supplied schema, without thoughts or commentary."
-        ),
-        temperature=0.0,
-    )
-    return parse_claim_proposals(result)
+    # ValueError covers pydantic ValidationError, JSON decode errors (including
+    # requests' own) and empty model content; OSError covers connection,
+    # timeout and HTTP status failures. Order matters: requests' JSONDecodeError
+    # is both, and means the service answered with garbage.
+    try:
+        result = llm.structured(
+            prompt,
+            ExtractedClaims,
+            tier="fast",
+            system=(
+                "You are a precise structured fact extractor. Output only valid JSON "
+                "matching the supplied schema, without thoughts or commentary."
+            ),
+            temperature=0.0,
+        )
+        return parse_claim_proposals(result)
+    except ValueError as exc:
+        raise MalformedExtractionError(f"{type(exc).__name__}: {exc}") from exc
+    except OSError as exc:
+        raise ClaimExtractionLLMError(f"{type(exc).__name__}: {exc}") from exc
