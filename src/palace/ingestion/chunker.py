@@ -130,6 +130,16 @@ def chunk_markdown(
     return chunks
 
 
+def is_archived_note(path: str | Path) -> bool:
+    """True for a raw note already consumed by compilation (``processed: true``).
+
+    Archived notes stay in the vault as the recoverable original but are kept
+    out of the search index; the compiled note that replaced them is indexed.
+    """
+    metadata, _ = _split_frontmatter(Path(path).read_text(encoding="utf-8"))
+    return metadata.get("processed") is True
+
+
 class MarkdownChunker:
     """Callable class form for dependency injection in the indexer."""
 

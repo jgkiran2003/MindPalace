@@ -214,6 +214,20 @@ def test_resolver_dry_run_does_not_write_and_normal_run_persists(
         assert store.db.execute("SELECT count(*) FROM vec_claims").fetchone()[0] == 1
 
 
+class _NoopIndexer:
+    """Stands in for VaultIndexer; real indexing is covered in test_phase4_compile."""
+
+    def __init__(self) -> None:
+        self.indexed: list[Path] = []
+
+    def index_file(self, path: Path) -> int:
+        self.indexed.append(Path(path))
+        return 0
+
+    def remove_file(self, path: Path) -> int:
+        return 0
+
+
 class _CompilerClient:
     def __init__(self) -> None:
         self.tiers: list[str] = []
@@ -255,7 +269,8 @@ def test_compiler_writes_frontmatter_and_marks_sources_processed(
         sources.append(source)
 
     client = _CompilerClient()
-    output = compile_raw_notes(vault, client=client)  # type: ignore[arg-type]
+    indexer = _NoopIndexer()
+    output = compile_raw_notes(vault, client=client, indexer=indexer)  # type: ignore[arg-type]
 
     assert output is not None
     assert output.exists()
@@ -264,6 +279,8 @@ def test_compiler_writes_frontmatter_and_marks_sources_processed(
     assert metadata["status"] == "compiled"
     assert metadata["source_type"] == "document"
     assert metadata["derived_from"] == ["Source 1", "Source 2", "Source 3"]
+    assert metadata["derived_from_paths"] == ["raw-1.md", "raw-2.md", "raw-3.md"]
+    assert metadata["generated"] is True
     assert body.startswith("# Consolidated Notes")
 
     for source in sources:
@@ -273,4 +290,6 @@ def test_compiler_writes_frontmatter_and_marks_sources_processed(
         assert source_metadata["compiled_into"] == output.name
         assert "observation" in source_body.lower()
 
-    assert compile_raw_notes(vault, client=client) is None  # type: ignore[arg-type]
+    # compiled note indexed first, then every source refreshed (archived)
+    assert indexer.indexed == [output, *sources]
+    assert compile_raw_notes(vault, client=client, indexer=indexer) is None  # type: ignore[arg-type]

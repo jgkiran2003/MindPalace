@@ -9,7 +9,7 @@ import click
 
 from palace.claims.extractor import extract_claim_proposals
 from palace.claims.resolver import resolve_and_store_proposals
-from palace.compilation.compiler import compile_raw_notes
+from palace.compilation.compiler import CompilationError, compile_raw_notes
 from palace.config import Settings, get_settings
 from palace.domain.models import (
     Claim,
@@ -19,7 +19,7 @@ from palace.domain.models import (
     Severity,
     SourceType,
 )
-from palace.ingestion.indexer import index_vault
+from palace.ingestion.indexer import VaultIndexer, index_vault
 from palace.llm.client import OllamaClient
 from palace.llm.embedder import OllamaEmbedder
 from palace.retrieval.hybrid_searcher import HybridSearcher
@@ -85,7 +85,10 @@ def app() -> None:
 @app.command("index")
 def index_command() -> None:
     stats = index_vault()
-    click.echo(f"Indexed {stats.chunks} chunks from {stats.documents} Markdown documents.")
+    message = f"Indexed {stats.chunks} chunks from {stats.documents} Markdown documents."
+    if stats.archived:
+        message += f" Skipped {stats.archived} archived (already compiled) raw notes."
+    click.echo(message)
 
 
 @app.command("search")
@@ -302,16 +305,28 @@ async def _chat_runner(dry_run: bool) -> None:
 
 @app.command("compile")
 def compile_command() -> None:
-    """Compile a batch of unprocessed raw notes into structured Markdown."""
+    """Compile raw notes into one indexed note and archive the raw originals."""
     settings = get_settings()
-    output = compile_raw_notes(
-        Path(settings.paths.vault_dir),
-        client=OllamaClient(settings=settings),
-    )
+    try:
+        output = compile_raw_notes(
+            Path(settings.paths.vault_dir),
+            client=OllamaClient(settings=settings),
+            indexer=VaultIndexer(settings=settings),
+        )
+    except CompilationError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except OSError as exc:
+        raise click.ClickException(
+            f"compilation failed, nothing was archived: {type(exc).__name__}: {exc}"
+        ) from exc
     if output is None:
         click.echo("Not enough unprocessed raw notes to compile.")
     else:
-        click.echo(f"Created compiled note: {output}")
+        click.echo(f"Created and indexed compiled note: {output}")
+        click.echo(
+            "Source notes were marked processed and removed from the search index; "
+            "the files remain in the vault."
+        )
 
 
 @app.group("claim")
