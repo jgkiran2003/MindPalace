@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "direct_identity",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "My name is Bob and I am a software engineer."
+        }
+      ],
+      "expected_claims": [
+        {"entity": "user", "attribute": "name", "value": "Bob"},
+        {
+          "entity": "user",
+          "attribute": "role",
+          "value": "software engineer"
+        }
+      ]
+    },
+    {
+      "id": "direct_tech",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "I set up Pi-hole at 192.168.1.5 for DNS ad-blocking."
+        }
+      ],
+      "expected_claims": [
+        {
+          "entity": "pi_hole",
+          "attribute": "ip_address",
+          "value": "192.168.1.5"
+        }
+      ]
+    },
+    {
+      "id": "question_identity",
+      "dialogue": [
+        {"role": "user", "content": "What is my name?"}
+      ],
+      "expected_claims": []
+    },
+    {
+      "id": "question_tech",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "What reverse proxy should I configure?"
+        }
+      ],
+      "expected_claims": []
+    },
+    {
+      "id": "chit_chat",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "Good morning! How are you doing today?"
+        }
+      ],
+      "expected_claims": []
+    },
+    {
+      "id": "opinion",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "Docker Compose is so much better than Kubernetes."
+        }
+      ],
+      "expected_claims": []
+    },
+    {
+      "id": "hypothetical",
+      "dialogue": [
+        {
+          "role": "user",
+          "content": "I might consider testing Cilium next month if I have time."
+        }
+      ],
+      "expected_claims": []
+    },
+    {
+      "id": "coreference",
+      "dialogue": [
+        {
+          "role": "assistant",
+          "content": "What OS are you running on the master node?"
+        },
+        {"role": "user", "content": "Debian 12"}
+      ],
+      "expected_claims": [
+        {
+          "entity": "master_node",
+          "attribute": "os",
+          "value": "Debian 12"
+        }
+      ]
+    }
+  ]
+}

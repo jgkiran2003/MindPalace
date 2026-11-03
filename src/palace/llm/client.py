@@ -122,6 +122,8 @@ class OllamaClient:
         async_client: httpx.AsyncClient | None = None,
         *,
         keep_alive: str | int | None = None,
+        fast_model: str | None = None,
+        reasoning_model: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self._session = session or requests.Session()
@@ -133,11 +135,11 @@ class OllamaClient:
             DEFAULT_KEEP_ALIVE,
         )
         self._models = {
-            "fast": os.getenv(
+            "fast": fast_model or os.getenv(
                 "PALACE_LLM_FAST_MODEL",
                 self.settings.llm.fast_tier_model,
             ),
-            "reasoning": os.getenv(
+            "reasoning": reasoning_model or os.getenv(
                 "PALACE_LLM_REASONING_MODEL",
                 self.settings.llm.reasoning_tier_model,
             ),
