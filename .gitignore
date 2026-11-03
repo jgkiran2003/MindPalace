@@ -19,7 +19,8 @@ dist/
 # Local environment files
 .env
 
-# Runtime data (data/vault/ is intentionally not ignored)
+# Runtime data (the vault holds personal notes and stays local)
+data/vault/
 data/lance/
 data/claims.db
 data/claims.db-*
